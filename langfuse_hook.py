@@ -6,13 +6,14 @@ Claude Code -> Langfuse hook
 
 import json
 import os
+import re
 import sys
 import time
 import hashlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 # --- Langfuse import (fail-open) ---
 try:
@@ -248,20 +249,84 @@ def get_usage_details(msg: Dict[str, Any]) -> Dict[str, int]:
 
 # Classify tool type
 def _classify_tool(tool_name: str) -> str:
-    claude_code_tools = {
+    claude_code_builtins = {
         "Read", "Write", "Edit", "Bash", "Glob", "Grep", "LS", "MultiEdit",
-        "NotebookEdit", "TodoWrite", "TodoRead", "Task", "WebFetch", "WebSearch",
+        "NotebookEdit", "TodoWrite", "TodoRead", "WebFetch", "WebSearch",
         "CronCreate", "CronDelete", "CronList", "Monitor", "PushNotification",
-        "RemoteTrigger", "ScheduleWakeup", "Skill"
+        "RemoteTrigger", "ScheduleWakeup",
     }
-    if tool_name in claude_code_tools:
+    if tool_name == "Skill":
+        return "skill"
+    if tool_name in ("Agent", "Task"):
+        return "agent"
+    if tool_name in claude_code_builtins:
         return "claude-code"
-    elif tool_name.startswith("mcp__"):
-        parts = tool_name.split("__")
-        if len(parts) >= 2:
-            return f"mcp-{parts[1]}"
-        return "mcp"
+    if tool_name.startswith("mcp__"):
+        parts = tool_name.split("__", 2)
+        server = parts[1] if len(parts) >= 2 else "unknown"
+        return f"mcp-{server}"
     return "unknown"
+
+
+def _obs_display_name(tc: Dict[str, Any]) -> str:
+    """Return a human-readable span name for a tool call."""
+    tool_name = tc["name"]
+    tool_type = tc["type"]
+    inp = tc.get("input") or {}
+
+    if tool_type == "skill":
+        skill = inp.get("skill", "unknown") if isinstance(inp, dict) else "unknown"
+        return f"Skill: {skill}"
+
+    if tool_type == "agent":
+        desc = ""
+        if isinstance(inp, dict):
+            desc = (inp.get("description", "") or inp.get("prompt", ""))[:80]
+        return f"Agent: {desc}" if desc else "Agent"
+
+    if tool_type.startswith("mcp-"):
+        server = tool_type[4:]
+        parts = tool_name.split("__", 2)
+        fn_name = parts[2] if len(parts) > 2 else tool_name
+        return f"MCP [{server}]: {fn_name}"
+
+    return f"Tool: {tool_name} [{tool_type}]"
+
+# ----------------- Subagent stitching helpers -----------------
+def _extract_agent_id(tool_result: Optional[str]) -> Optional[str]:
+    """
+    The Agent tool result includes a trailing line: 'agentId: <hex>'.
+    Extract that hex ID so we can locate the subagent transcript.
+    """
+    if not tool_result:
+        return None
+    m = re.search(r'\bagentId:\s*([0-9a-f]+)', tool_result)
+    return m.group(1) if m else None
+
+
+def _subagent_jsonl_path(transcript_path: Path, session_id: str, agent_id: str) -> Path:
+    """
+    Deterministic path: <transcript_dir>/<session_id>/subagents/agent-<agent_id>.jsonl
+    """
+    return transcript_path.parent / session_id / "subagents" / f"agent-{agent_id}.jsonl"
+
+
+def _read_all_jsonl(path: Path) -> List[Dict[str, Any]]:
+    """Read an entire JSONL file at once (used for complete subagent transcripts)."""
+    msgs: List[Dict[str, Any]] = []
+    try:
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                msgs.append(json.loads(line))
+            except Exception:
+                continue
+    except Exception as e:
+        debug(f"_read_all_jsonl failed for {path}: {e}")
+    return msgs
+
 
 # ----------------- Incremental reader -----------------
 @dataclass
@@ -416,7 +481,92 @@ def _tool_calls_from_assistants(assistant_msgs: List[Dict[str, Any]]) -> List[Di
             })
     return calls
 
-def emit_turn(langfuse: Langfuse, session_id: str, turn_num: int, turn: Turn, transcript_path: Path) -> None:
+
+def _emit_tool_spans(langfuse: Langfuse, tool_calls: List[Dict[str, Any]], emitted_agents: Set[str], transcript_path: Path, session_id: str) -> None:
+    """Emit all tool calls as child spans of the currently-active span."""
+    for tc in tool_calls:
+        in_obj = tc["input"]
+        if isinstance(in_obj, str):
+            in_obj, in_meta = truncate_text(in_obj)
+        else:
+            in_meta = None
+
+        obs_name = _obs_display_name(tc)
+
+        meta: Dict[str, Any] = {
+            "tool_name": tc["name"],
+            "tool_type": tc["type"],
+            "tool_id": tc["id"],
+            "input_meta": in_meta,
+            "output_meta": tc.get("output_meta"),
+        }
+        if tc["type"] == "skill" and isinstance(tc.get("input"), dict):
+            meta["skill_name"] = tc["input"].get("skill")
+            meta["skill_args"] = tc["input"].get("args")
+        elif tc["type"] == "agent" and isinstance(tc.get("input"), dict):
+            meta["agent_description"] = tc["input"].get("description")
+            meta["agent_subagent_type"] = tc["input"].get("subagent_type")
+        elif tc["type"].startswith("mcp-"):
+            meta["mcp_server"] = tc["type"][4:]
+            meta["mcp_function"] = (
+                tc["name"].split("__", 2)[2]
+                if tc["name"].count("__") >= 2
+                else tc["name"]
+            )
+
+        with langfuse.start_as_current_span(
+            name=obs_name,
+            input=in_obj,
+            output=tc.get("output"),
+            metadata=meta,
+        ):
+            # For Agent calls: emit subagent transcript as nested child turns
+            if tc["type"] == "agent":
+                agent_id = _extract_agent_id(tc.get("output", ""))
+                if agent_id:
+                    sub_path = _subagent_jsonl_path(transcript_path, session_id, agent_id)
+                    _emit_subagent_turns(langfuse, agent_id, sub_path, emitted_agents)
+
+
+def _emit_subagent_turns(langfuse: Langfuse, agent_id: str, subagent_path: Path, emitted_agents: Set[str]) -> None:
+    """
+    Read and emit the subagent transcript as nested child spans of the active Agent span.
+    Skips if the agent was already emitted this session (idempotent across hook firings).
+    """
+    if agent_id in emitted_agents:
+        debug(f"Subagent {agent_id} already emitted, skipping")
+        return
+    if not subagent_path.exists():
+        debug(f"Subagent transcript not found: {subagent_path}")
+        emitted_agents.add(agent_id)
+        return
+
+    msgs = _read_all_jsonl(subagent_path)
+    turns = build_turns(msgs)
+    emitted_agents.add(agent_id)
+
+    if not turns:
+        debug(f"Subagent {agent_id}: no turns parsed")
+        return
+
+    for i, turn in enumerate(turns, start=1):
+        try:
+            _emit_single_subagent_turn(langfuse, agent_id, i, turn, emitted_agents, subagent_path)
+        except Exception as e:
+            debug(f"Subagent {agent_id} turn {i} emit failed: {e}")
+
+    debug(f"Emitted {len(turns)} turns for subagent {agent_id}")
+
+
+def _emit_single_subagent_turn(
+    langfuse: Langfuse,
+    agent_id: str,
+    turn_num: int,
+    turn: "Turn",
+    emitted_agents: Set[str],
+    subagent_path: Path,
+) -> None:
+    """Emit one subagent turn as a child span within the active Agent span."""
     user_text_raw = extract_text(get_content(turn.user_msg))
     user_text, user_text_meta = truncate_text(user_text_raw)
 
@@ -426,10 +576,8 @@ def emit_turn(langfuse: Langfuse, session_id: str, turn_num: int, turn: Turn, tr
 
     model = get_model(turn.assistant_msgs[0])
     usage_details = get_usage_details(last_assistant)
-
     tool_calls = _tool_calls_from_assistants(turn.assistant_msgs)
 
-    # attach tool outputs
     for c in tool_calls:
         if c["id"] and c["id"] in turn.tool_results_by_id:
             out_raw = turn.tool_results_by_id[c["id"]]
@@ -440,7 +588,51 @@ def emit_turn(langfuse: Langfuse, session_id: str, turn_num: int, turn: Turn, tr
         else:
             c["output"] = None
 
-    # Create root span (as_current makes it the active span for session_id setting)
+    with langfuse.start_as_current_span(
+        name=f"Subagent Turn {turn_num}",
+        input={"role": "user", "content": user_text},
+        metadata={"agent_id": agent_id, "turn_number": turn_num, "user_text": user_text_meta},
+    ):
+        with langfuse.start_as_current_generation(
+            name="Claude Response",
+            model=model,
+            input={"role": "user", "content": user_text},
+            output={"role": "assistant", "content": assistant_text},
+            usage_details=usage_details if usage_details else None,
+            metadata={"assistant_text": assistant_text_meta, "tool_count": len(tool_calls)},
+        ):
+            pass
+
+        # subagent_path parent is <session_id>/subagents/ — the parent transcript dir is two levels up
+        parent_transcript_dir = subagent_path.parent.parent.parent
+        # session_id is the directory name one level up from subagents/
+        sub_session_id = subagent_path.parent.parent.name
+        synthetic_transcript = parent_transcript_dir / f"{sub_session_id}.jsonl"
+        _emit_tool_spans(langfuse, tool_calls, emitted_agents, synthetic_transcript, sub_session_id)
+
+
+def emit_turn(langfuse: Langfuse, session_id: str, turn_num: int, turn: Turn, transcript_path: Path, emitted_agents: Set[str]) -> None:
+    user_text_raw = extract_text(get_content(turn.user_msg))
+    user_text, user_text_meta = truncate_text(user_text_raw)
+
+    last_assistant = turn.assistant_msgs[-1]
+    assistant_text_raw = extract_text(get_content(last_assistant))
+    assistant_text, assistant_text_meta = truncate_text(assistant_text_raw)
+
+    model = get_model(turn.assistant_msgs[0])
+    usage_details = get_usage_details(last_assistant)
+    tool_calls = _tool_calls_from_assistants(turn.assistant_msgs)
+
+    for c in tool_calls:
+        if c["id"] and c["id"] in turn.tool_results_by_id:
+            out_raw = turn.tool_results_by_id[c["id"]]
+            out_str = out_raw if isinstance(out_raw, str) else json.dumps(out_raw, ensure_ascii=False)
+            out_trunc, out_meta = truncate_text(out_str)
+            c["output"] = out_trunc
+            c["output_meta"] = out_meta
+        else:
+            c["output"] = None
+
     with langfuse.start_as_current_span(
         name=f"Claude Code - Turn {turn_num}",
         input={"role": "user", "content": user_text},
@@ -452,47 +644,19 @@ def emit_turn(langfuse: Langfuse, session_id: str, turn_num: int, turn: Turn, tr
             "user_text": user_text_meta,
         },
     ):
-        # Set session ID at trace level (requires active span)
         langfuse.update_current_trace(session_id=session_id)
 
-        # LLM generation
-        with langfuse.start_as_current_observation(
+        with langfuse.start_as_current_generation(
             name="Claude Response",
-            as_type="generation",
             model=model,
             input={"role": "user", "content": user_text},
             output={"role": "assistant", "content": assistant_text},
             usage_details=usage_details if usage_details else None,
-            metadata={
-                "assistant_text": assistant_text_meta,
-                "tool_count": len(tool_calls),
-            },
+            metadata={"assistant_text": assistant_text_meta, "tool_count": len(tool_calls)},
         ):
             pass
 
-        # Tool observations
-        for tc in tool_calls:
-            in_obj = tc["input"]
-            # truncate tool input if it's a large string payload
-            if isinstance(in_obj, str):
-                in_obj, in_meta = truncate_text(in_obj)
-            else:
-                in_meta = None
-
-            with langfuse.start_as_current_observation(
-                name=f"Tool: {tc['name']} [{tc['type']}]",
-                as_type="tool",
-                input=in_obj,
-                output=tc.get("output"),
-                metadata={
-                    "tool_name": tc["name"],
-                    "tool_type": tc["type"],
-                    "tool_id": tc["id"],
-                    "input_meta": in_meta,
-                    "output_meta": tc.get("output_meta"),
-                },
-            ):
-                pass
+        _emit_tool_spans(langfuse, tool_calls, emitted_agents, transcript_path, session_id)
 
 # ----------------- Main -----------------
 def main() -> int:
@@ -532,6 +696,10 @@ def main() -> int:
             key = state_key(session_id, str(transcript_path))
             ss = load_session_state(state, key)
 
+            # emitted_agents: tracks which subagent IDs have been stitched into Langfuse
+            # stored globally (agentIds are unique per invocation)
+            emitted_agents: Set[str] = set(state.get("emitted_subagents", []))
+
             msgs, ss = read_new_jsonl(transcript_path, ss)
             if not msgs:
                 write_session_state(state, key, ss)
@@ -544,19 +712,18 @@ def main() -> int:
                 save_state(state)
                 return 0
 
-            # emit turns
             emitted = 0
             for t in turns:
                 emitted += 1
                 turn_num = ss.turn_count + emitted
                 try:
-                    emit_turn(langfuse, session_id, turn_num, t, transcript_path)
+                    emit_turn(langfuse, session_id, turn_num, t, transcript_path, emitted_agents)
                 except Exception as e:
                     debug(f"emit_turn failed: {e}")
-                    # continue emitting other turns
 
             ss.turn_count += emitted
             write_session_state(state, key, ss)
+            state["emitted_subagents"] = list(emitted_agents)
             save_state(state)
 
         try:
