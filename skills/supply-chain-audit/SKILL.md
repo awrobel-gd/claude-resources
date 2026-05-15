@@ -9,13 +9,79 @@ description: Audit the local machine for Node.js projects affected by the mini-S
 
 The mini-Shai-Hulud campaign compromised 100+ npm package versions by injecting a self-spreading worm via GitHub OIDC token theft. It reads CI runner memory directly (`/proc/{pid}/mem`) to steal every secret, then republishes infected versions of any package the victim maintains. Affected package families include `@tanstack/*`, `@mistralai/*`, `@opensearch-project/*`, `@uipath/*`, `@draftlab/*`.
 
+### Claude Code as a Persistence and Exfiltration Vector
+
+**CRITICAL:** The worm injects hooks into `~/.claude/settings.json` (global) and `.claude/settings.json` (per-project). A `SessionStart` hook runs every time Claude Code launches — giving the worm a persistent code execution vector inside the AI agent's session, with full access to credentials, file system, and tool calls. This means:
+
+- The compromised Claude session can silently exfiltrate secrets during any user interaction
+- The worm can reinstall itself via a hook even after `node_modules` cleanup
+- **If this audit is run from within a compromised Claude session, findings cannot be fully trusted** — the hook could suppress or alter output
+
+**Phase 0 must be run first and verified by the user before the audit continues.**
+
+### Dead Man's Switch
+
+The worm installs a ransom mechanism on the npm publish token:
+- Token description is set to: `IfYouRevokeThisTokenItWillWipeTheComputerOfTheOwner`
+- A background service (`gh-token-monitor.service` on Linux) monitors token validity
+- **Do NOT revoke the npm token without understanding and disabling the wiper first**
+- On macOS, look for equivalent LaunchAgent persistence (see Phase 3)
+
 Reference: https://www.stepsecurity.io/blog/mini-shai-hulud-is-back-a-self-spreading-supply-chain-attack-hits-the-npm-ecosystem
 
 ---
 
 ## Execution Steps
 
-Execute all phases in order. Do not skip any phase.
+Execute all phases in order. **Do not skip Phase 0.**
+
+---
+
+### Phase 0 — Verify Claude Environment (MUST RUN FIRST)
+
+**Why first:** If Claude's own hooks are compromised, the rest of this audit runs inside a hostile process. Verify the global Claude config and all hook scripts before proceeding. Show output to the user and wait for explicit confirmation before continuing.
+
+#### Step 0.1 — Inspect global Claude settings for unexpected hooks
+
+```bash
+cat ~/.claude/settings.json
+```
+
+Look for any hooks under `hooks` key (SessionStart, PreToolUse, PostToolUse, Stop, etc.). The worm specifically targets `SessionStart`. Note every `command` value for Step 0.2.
+
+#### Step 0.2 — Read and verify every hook script referenced in settings.json
+
+For each command found in Step 0.1, read the file and display its full contents to the user:
+
+```bash
+# Example — substitute actual paths found in Step 0.1
+cat ~/.claude/hooks/<hook-file>
+```
+
+Flag as **CRITICAL** if any hook script:
+- Makes network requests to unknown hosts
+- Reads environment variables or credential files (`~/.aws`, `~/.npmrc`, `~/.ssh`, etc.)
+- Executes dynamic code (`eval`, `exec`, subprocess with variable expansion)
+- Was recently modified (check `ls -la`)
+
+#### Step 0.3 — Check modification timestamps on hook files
+
+```bash
+ls -la ~/.claude/hooks/
+```
+
+A recently modified hook (especially one modified around the time an affected npm package was installed) is a strong signal of compromise.
+
+#### Step 0.4 — Check for per-project Claude settings with hooks
+
+```bash
+find ~ -name "settings.json" -path "*/.claude/settings.json" \
+  -not -path "*/node_modules/*" \
+  2>/dev/null \
+  | xargs grep -l "SessionStart\|PreToolUse\|PostToolUse" 2>/dev/null
+```
+
+**STOP AND SHOW RESULTS TO USER. Wait for explicit confirmation before Phase 1.**
 
 ---
 
@@ -200,12 +266,24 @@ Run once, not per-project.
 # Systemd persistence (Linux only)
 ls ~/.config/systemd/user/gh-token-monitor.service 2>/dev/null
 
-# npm tokens with ransom threat in description (requires npm login)
+# macOS LaunchAgent persistence (equivalent to Linux systemd unit)
+ls ~/Library/LaunchAgents/ 2>/dev/null
+# Inspect any unfamiliar plist — the worm uses plausible-sounding names
+# Look for: RunAtLoad=true, ProgramArguments pointing to a JS/shell script
+
+# npm tokens with ransom threat in description — READ ONLY, do NOT revoke
+# ⚠️  DEAD MAN'S SWITCH: revoking the flagged token may trigger the wiper
+# Document the token name/ID for incident response; disable the wiper first
 npm token list 2>/dev/null | grep -i "IfYouRevokeThis\|wipe"
 
 # Any unexpected process connecting to known C2
 lsof -i 2>/dev/null | grep -E "masscan\.cloud|getsession\.org|git-tanstack\.com"
+
+# Active processes with suspicious names (cross-platform)
+ps aux 2>/dev/null | grep -E "gh-token|token-monitor|tanstack" | grep -v grep
 ```
+
+**⚠️ If the npm token check returns a match: do NOT revoke the token. Document its ID and contact your security team. The wiper must be identified and neutralized (find and kill/disable the monitor process and its persistence unit) before the token is safely revocable.**
 
 ---
 
@@ -278,8 +356,10 @@ For each flagged project:
 |---|---|
 | `.github/workflows/codeql_analysis.yml` | Re-infection via CI |
 | `.vscode/tasks.json` | Persistence on folder open |
-| `.claude/settings.json` | Persistence via SessionStart hook |
-| `~/.config/systemd/user/gh-token-monitor.service` | Linux boot persistence |
+| `~/.claude/settings.json` | **Global** Claude hook injection — runs every session start |
+| `.claude/settings.json` | Per-project Claude hook injection |
+| `~/.config/systemd/user/gh-token-monitor.service` | Linux boot persistence / dead man's switch monitor |
+| `~/Library/LaunchAgents/<name>.plist` | macOS boot persistence / dead man's switch monitor |
 
 ### C2 Domains
 - `api.masscan.cloud`
