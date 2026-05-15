@@ -240,6 +240,50 @@ def get_message_id(msg: Dict[str, Any]) -> Optional[str]:
             return mid
     return None
 
+
+def _merge_content_blocks(existing_content: list, new_content: list) -> list:
+    """Merge two content block lists: text blocks from new (latest streaming state),
+    tool_use blocks are the deduped union (by block id) of both lists."""
+    tool_use_by_id: Dict[str, Dict] = {}
+    tool_use_order: List[str] = []
+
+    for block in existing_content:
+        if isinstance(block, dict) and block.get("type") == "tool_use":
+            bid = block.get("id", "")
+            if bid and bid not in tool_use_by_id:
+                tool_use_order.append(bid)
+                tool_use_by_id[bid] = block
+
+    for block in new_content:
+        if isinstance(block, dict) and block.get("type") == "tool_use":
+            bid = block.get("id", "")
+            if bid and bid not in tool_use_by_id:
+                tool_use_order.append(bid)
+                tool_use_by_id[bid] = block
+
+    text_blocks = [b for b in new_content if isinstance(b, dict) and b.get("type") == "text"]
+    return text_blocks + [tool_use_by_id[bid] for bid in tool_use_order]
+
+
+def _merge_assistant_msg(existing: Dict[str, Any], new: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a new message dict with content blocks merged from existing and new."""
+    existing_content = get_content(existing)
+    new_content = get_content(new)
+
+    if not isinstance(existing_content, list) or not isinstance(new_content, list):
+        return new
+
+    merged_content = _merge_content_blocks(existing_content, new_content)
+
+    merged = dict(new)
+    if "message" in merged and isinstance(merged.get("message"), dict):
+        merged["message"] = dict(merged["message"])
+        merged["message"]["content"] = merged_content
+    elif "content" in merged:
+        merged["content"] = merged_content
+
+    return merged
+
 # Extract usage from message
 def get_usage_details(msg: Dict[str, Any]) -> Dict[str, int]:
     m = msg.get("message")
@@ -462,7 +506,9 @@ def build_turns(messages: List[Dict[str, Any]]) -> List[Turn]:
             mid = get_message_id(msg) or f"noid:{len(assistant_order)}"
             if mid not in assistant_latest:
                 assistant_order.append(mid)
-            assistant_latest[mid] = msg
+                assistant_latest[mid] = msg
+            else:
+                assistant_latest[mid] = _merge_assistant_msg(assistant_latest[mid], msg)
             continue
 
         # ignore unknown rows
@@ -616,6 +662,17 @@ def _emit_single_subagent_turn(
         _emit_tool_spans(langfuse, tool_calls, emitted_agents, synthetic_transcript, sub_session_id)
 
 
+def _extract_slash_command(user_text: str) -> Optional[Tuple[str, str]]:
+    """Return (command_name, args) if the user text contains a harness-injected slash command marker."""
+    name_match = re.search(r'<command-name>(/[^<\s]+)', user_text)
+    if not name_match:
+        return None
+    cmd = name_match.group(1).lstrip("/").strip()
+    args_match = re.search(r'<command-args>(.*?)</command-args>', user_text, re.DOTALL)
+    args = args_match.group(1).strip() if args_match else ""
+    return cmd, args
+
+
 def emit_turn(langfuse: Langfuse, session_id: str, trace_id: str, turn_num: int, turn: Turn, transcript_path: Path, emitted_agents: Set[str]) -> None:
     user_text_raw = extract_text(get_content(turn.user_msg))
     user_text, user_text_meta = truncate_text(user_text_raw)
@@ -627,6 +684,18 @@ def emit_turn(langfuse: Langfuse, session_id: str, trace_id: str, turn_num: int,
     model = get_model(turn.assistant_msgs[0])
     usage_details = get_usage_details(last_assistant)
     tool_calls = _tool_calls_from_assistants(turn.assistant_msgs)
+
+    slash_cmd = _extract_slash_command(user_text_raw)
+    if slash_cmd:
+        cmd_name, cmd_args = slash_cmd
+        tool_calls = [{
+            "id": f"synthetic-skill-{cmd_name}",
+            "name": "Skill",
+            "type": "skill",
+            "input": {"skill": cmd_name, "args": cmd_args, "rendered_body_len": len(user_text_raw)},
+            "output": None,
+            "output_meta": None,
+        }] + tool_calls
 
     for c in tool_calls:
         if c["id"] and c["id"] in turn.tool_results_by_id:
